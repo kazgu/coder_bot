@@ -1,6 +1,6 @@
 # Coder Bot
 
-Feishu (Lark) bot that bridges chat with Claude Code CLI. Spawns local Claude Code processes, supports multi-turn conversations, and provides smart permission approval — safe operations auto-approve while dangerous commands require explicit confirmation.
+Feishu (Lark)  bot that bridges chat with Claude Code CLI. Spawns local Claude Code processes, supports multi-turn conversations, and provides smart permission approval — safe operations auto-approve while dangerous commands require explicit confirmation.
 
 ## Quick Start
 
