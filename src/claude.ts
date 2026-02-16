@@ -618,15 +618,7 @@ const SAFE_TOOLS = new Set([
     'AskUserQuestion',
     'EnterPlanMode', 'ExitPlanMode',
     'mcp__ide__getDiagnostics',
-    'mcp__ide__executeCode',
-]);
-
-/** 文件写入工具，自动批准（等同 acceptEdits） */
-const EDIT_TOOLS = new Set([
-    'Write', 'write',
-    'Edit', 'edit',
-    'NotebookEdit',
-    'MultiEdit',
+    // 'mcp__ide__executeCode',
 ]);
 
 /** Bash 命令中的危险前缀 */
@@ -665,7 +657,6 @@ function shouldAutoApprove(toolName: string, input: unknown): boolean {
     }
 
     if (SAFE_TOOLS.has(toolName)) return true;
-    if (EDIT_TOOLS.has(toolName)) return true;
 
     if (toolName === 'Bash' || toolName === 'bash') {
         const obj = input as Record<string, unknown> | null;
