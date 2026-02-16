@@ -1,0 +1,328 @@
+import type { ClaudeConfig } from './config';
+import type { FeishuClient } from './feishu/client';
+import { ClaudeProcess, type ClaudeMessage, type PendingPermission } from './claude';
+
+interface ChatSession {
+    claude: ClaudeProcess;
+    chatId: string;
+    cwd: string;
+    /** debounce 缓冲区 */
+    textBuffer: string[];
+    flushTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const DEBOUNCE_MS = 1500;
+
+/**
+ * 桥接飞书聊天和 Claude Code 进程。
+ * 每个飞书 chat 对应一个独立的 Claude 进程。
+ * 支持权限审批：Claude 请求工具权限时推送飞书通知，
+ * 用户通过 /allow 和 /deny 命令响应。
+ */
+export class Bridge {
+    private readonly claudeConfig: ClaudeConfig;
+    private readonly feishu: FeishuClient;
+    private readonly sessions = new Map<string, ChatSession>();
+
+    constructor(claudeConfig: ClaudeConfig, feishu: FeishuClient) {
+        this.claudeConfig = claudeConfig;
+        this.feishu = feishu;
+    }
+
+    /** 处理飞书消息 */
+    async handleMessage(chatId: string, messageId: string, text: string): Promise<void> {
+        // 处理命令
+        if (text.startsWith('/')) {
+            const reply = await this.handleCommand(chatId, text);
+            if (reply) {
+                await this.feishu.replyText(messageId, reply);
+                return;
+            }
+        }
+
+        // 获取或创建 Claude 会话
+        let session = this.sessions.get(chatId);
+        if (!session || !session.claude.isAlive()) {
+            session = this.createSession(chatId);
+            this.sessions.set(chatId, session);
+        }
+
+        try {
+            session.claude.send(text);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.feishu.replyText(messageId, `发送失败: ${msg}`);
+        }
+    }
+
+    /** 创建新的 Claude 会话 */
+    private createSession(chatId: string, cwd?: string): ChatSession {
+        // 关闭旧会话
+        const old = this.sessions.get(chatId);
+        if (old) {
+            this.flushText(old);
+            old.claude.kill();
+        }
+
+        const sessionCwd = cwd || old?.cwd || this.claudeConfig.cwd;
+        const config = { ...this.claudeConfig, cwd: sessionCwd };
+        const claude = new ClaudeProcess(config);
+        const session: ChatSession = {
+            claude,
+            chatId,
+            cwd: sessionCwd,
+            textBuffer: [],
+            flushTimer: null,
+        };
+
+        claude.start(
+            (msg) => this.handleClaudeMessage(session, msg),
+            (perm) => this.handlePermissionRequest(session, perm),
+        );
+
+        return session;
+    }
+
+    /** 处理 Claude 输出消息 */
+    private handleClaudeMessage(session: ChatSession, msg: ClaudeMessage): void {
+        if (msg.type === 'assistant' && msg.message) {
+            const content = msg.message.content;
+            if (typeof content === 'string') {
+                this.appendText(session, content);
+            } else if (Array.isArray(content)) {
+                for (const block of content) {
+                    if (block.type === 'text' && block.text) {
+                        this.appendText(session, block.text);
+                    } else if (block.type === 'tool_use') {
+                        this.flushText(session);
+                        const name = block.name || 'unknown';
+                        void this.feishu.sendText(session.chatId, `🔧 ${name}`);
+                    }
+                }
+            }
+        } else if (msg.type === 'result') {
+            this.flushText(session);
+            if (msg.is_error) {
+                void this.feishu.sendText(session.chatId, `❌ ${msg.result || '执行出错'}`);
+            }
+        }
+    }
+
+    /** 处理权限请求 — 推送飞书通知 */
+    private handlePermissionRequest(session: ChatSession, perm: PendingPermission): void {
+        this.flushText(session);
+
+        const inputStr = formatPermissionInput(perm.toolName, perm.input);
+        const text = [
+            `⚠️ Claude 请求权限`,
+            `工具: ${perm.toolName}`,
+            inputStr,
+            '',
+            '回复 /allow 批准 · /deny 拒绝',
+        ].join('\n');
+
+        void this.feishu.sendText(session.chatId, text);
+    }
+
+    /** 追加文本到 debounce 缓冲区 */
+    private appendText(session: ChatSession, text: string): void {
+        session.textBuffer.push(text);
+        if (session.flushTimer) {
+            clearTimeout(session.flushTimer);
+        }
+        session.flushTimer = setTimeout(() => this.flushText(session), DEBOUNCE_MS);
+    }
+
+    /** 立即发送缓冲区 */
+    private flushText(session: ChatSession): void {
+        if (session.flushTimer) {
+            clearTimeout(session.flushTimer);
+            session.flushTimer = null;
+        }
+        if (session.textBuffer.length === 0) return;
+
+        const text = session.textBuffer.join('');
+        session.textBuffer = [];
+
+        if (text.trim()) {
+            void this.feishu.sendText(session.chatId, text);
+        }
+    }
+
+    /** 处理斜杠命令 */
+    private async handleCommand(chatId: string, text: string): Promise<string | null> {
+        const trimmed = text.trim();
+        const parts = trimmed.split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+
+        if (cmd === '/help') {
+            return [
+                '可用命令:',
+                '/new — 重新开始一个 Claude 会话',
+                '/cd <path> — 设置工作目录并重建会话',
+                '/cwd — 查看当前工作目录',
+                '/status — 查看当前会话状态',
+                '/allow — 批准最新的权限请求',
+                '/allow all — 批准所有待处理的权限请求',
+                '/deny — 拒绝最新的权限请求',
+                '/deny all — 拒绝所有待处理的权限请求',
+                '/pending — 查看待处理的权限请求',
+                '/help — 显示帮助',
+                '',
+                '直接发文本即可与 Claude Code 对话。',
+            ].join('\n');
+        }
+
+        if (cmd === '/new') {
+            const session = this.createSession(chatId);
+            this.sessions.set(chatId, session);
+            return `已创建新的 Claude 会话。\n工作目录: ${session.cwd}`;
+        }
+
+        if (cmd === '/cd') {
+            const path = trimmed.slice(3).trim();
+            if (!path) return '用法: /cd <path>';
+            const resolved = path.startsWith('/')
+                ? path
+                : `${this.sessions.get(chatId)?.cwd || this.claudeConfig.cwd}/${path}`;
+            const session = this.createSession(chatId, resolved);
+            this.sessions.set(chatId, session);
+            return `工作目录已切换到: ${resolved}\n已重建 Claude 会话。`;
+        }
+
+        if (cmd === '/cwd') {
+            const session = this.sessions.get(chatId);
+            const cwd = session?.cwd || this.claudeConfig.cwd;
+            return `当前工作目录: ${cwd}`;
+        }
+
+        if (cmd === '/status') {
+            const session = this.sessions.get(chatId);
+            if (!session) return '当前没有活跃会话。发消息即可自动创建。';
+            const alive = session.claude.isAlive() ? '运行中' : '已停止';
+            const sid = session.claude.getSessionId() || '(未知)';
+            const pending = session.claude.getPendingPermissions();
+            const pendingStr = pending.length > 0
+                ? `\n待审批权限: ${pending.length} 个`
+                : '';
+            return `状态: ${alive}\nSession: ${sid}\n工作目录: ${session.cwd}${pendingStr}`;
+        }
+
+        if (cmd === '/allow') {
+            return this.handleAllow(chatId, parts[1]);
+        }
+
+        if (cmd === '/deny') {
+            return this.handleDeny(chatId, parts[1]);
+        }
+
+        if (cmd === '/pending') {
+            return this.handlePending(chatId);
+        }
+
+        return null;
+    }
+
+    /** 处理 /allow 命令 */
+    private handleAllow(chatId: string, arg?: string): string {
+        const session = this.sessions.get(chatId);
+        if (!session || !session.claude.isAlive()) {
+            return '当前没有活跃会话。';
+        }
+
+        if (arg === 'all') {
+            const count = session.claude.approveAll();
+            return count > 0
+                ? `已批准 ${count} 个权限请求。`
+                : '没有待处理的权限请求。';
+        }
+
+        // 批准最新的一个
+        const pending = session.claude.getPendingPermissions();
+        if (pending.length === 0) {
+            return '没有待处理的权限请求。';
+        }
+
+        const latest = pending[pending.length - 1];
+        session.claude.approvePermission(latest.requestId);
+        return `已批准: ${latest.toolName}`;
+    }
+
+    /** 处理 /deny 命令 */
+    private handleDeny(chatId: string, arg?: string): string {
+        const session = this.sessions.get(chatId);
+        if (!session || !session.claude.isAlive()) {
+            return '当前没有活跃会话。';
+        }
+
+        if (arg === 'all') {
+            const count = session.claude.denyAll();
+            return count > 0
+                ? `已拒绝 ${count} 个权限请求。`
+                : '没有待处理的权限请求。';
+        }
+
+        const pending = session.claude.getPendingPermissions();
+        if (pending.length === 0) {
+            return '没有待处理的权限请求。';
+        }
+
+        const latest = pending[pending.length - 1];
+        session.claude.denyPermission(latest.requestId);
+        return `已拒绝: ${latest.toolName}`;
+    }
+
+    /** 处理 /pending 命令 */
+    private handlePending(chatId: string): string {
+        const session = this.sessions.get(chatId);
+        if (!session || !session.claude.isAlive()) {
+            return '当前没有活跃会话。';
+        }
+
+        const pending = session.claude.getPendingPermissions();
+        if (pending.length === 0) {
+            return '没有待处理的权限请求。';
+        }
+
+        const lines = pending.map((p, i) => {
+            const inputStr = formatPermissionInput(p.toolName, p.input);
+            return `${i + 1}. ${p.toolName}\n   ${inputStr}`;
+        });
+
+        return `待处理的权限请求 (${pending.length}):\n\n${lines.join('\n\n')}`;
+    }
+
+    /** 关闭所有会话 */
+    close(): void {
+        for (const session of this.sessions.values()) {
+            this.flushText(session);
+            session.claude.kill();
+        }
+        this.sessions.clear();
+    }
+}
+
+/** 格式化权限请求的 input 为可读文本 */
+function formatPermissionInput(toolName: string, input: unknown): string {
+    if (!input || typeof input !== 'object') return '';
+
+    const obj = input as Record<string, unknown>;
+
+    // Bash 命令
+    if (toolName === 'Bash' || toolName === 'bash') {
+        if (obj.command) return `命令: ${obj.command}`;
+    }
+
+    // 文件编辑
+    if (obj.file_path || obj.path) {
+        const path = (obj.file_path || obj.path) as string;
+        return `文件: ${path}`;
+    }
+
+    // 通用：截断显示
+    const str = JSON.stringify(input);
+    if (str.length > 200) {
+        return str.slice(0, 200) + '...';
+    }
+    return str;
+}
