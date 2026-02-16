@@ -78,6 +78,9 @@ export class Bridge {
         claude.start(
             (msg) => this.handleClaudeMessage(session, msg),
             (perm) => this.handlePermissionRequest(session, perm),
+            () => {
+                void this.feishu.sendText(session.chatId, '⚠️ 检测到工具调用死循环，已自动中断。发 /new 重建会话。');
+            },
         );
 
         return session;
