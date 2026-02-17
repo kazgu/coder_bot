@@ -179,7 +179,7 @@ export class ClaudeProcess {
 
     /** 连续工具错误计数 */
     private consecutiveToolErrors = 0;
-    private static readonly MAX_TOOL_ERROR_RETRIES = 10;
+    private static readonly MAX_TOOL_ERROR_RETRIES = 20;
 
     /** 消息流 */
     private inputStream = new Stream<ClaudeMessage>();
@@ -318,8 +318,11 @@ export class ClaudeProcess {
 
                 // 检测 tool error 死循环
                 if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
-                    const hasToolError = msg.message!.content.some(
-                        (b) => b.type === 'tool_result' && b.is_error === true,
+                    const toolResults = msg.message!.content.filter(
+                        (b) => b.type === 'tool_result',
+                    );
+                    const hasToolError = toolResults.length > 0 && toolResults.every(
+                        (b) => b.is_error === true,
                     );
                     if (hasToolError) {
                         this.consecutiveToolErrors++;
@@ -330,6 +333,8 @@ export class ClaudeProcess {
                             this.onLoopDetected?.();
                             continue;
                         }
+                    } else {
+                        this.consecutiveToolErrors = 0;
                     }
                 }
 
