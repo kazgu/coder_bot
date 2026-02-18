@@ -1,6 +1,6 @@
 import type { ClaudeConfig } from './config';
 import type { FeishuClient } from './feishu/client';
-import { ClaudeProcess, type ClaudeMessage, type PendingPermission, type ContentBlock } from './claude';
+import { ClaudeProcess, listSessions, type ClaudeMessage, type PendingPermission, type ContentBlock, type SessionInfo } from './claude';
 
 interface ChatSession {
     claude: ClaudeProcess;
@@ -20,6 +20,8 @@ interface ChatSession {
         }>;
         originalInput: Record<string, unknown>;
     } | null;
+    /** 等待用户选择要恢复的 session */
+    pendingResume: SessionInfo[] | null;
 }
 
 const DEBOUNCE_MS = 1500;
@@ -72,6 +74,12 @@ export class Bridge {
             return;
         }
 
+        // 如果有待选择的 resume session，将用户消息作为选择
+        if (session.pendingResume && !text.startsWith('/')) {
+            await this.resolveResume(session, chatId, text);
+            return;
+        }
+
         try {
             session.claude.send(text);
         } catch (err) {
@@ -112,7 +120,7 @@ export class Bridge {
     }
 
     /** 创建新的 Claude 会话 */
-    private createSession(chatId: string, options?: { cwd?: string; continue?: boolean }): ChatSession {
+    private createSession(chatId: string, options?: { cwd?: string; continue?: boolean; resume?: string }): ChatSession {
         // 关闭旧会话
         const old = this.sessions.get(chatId);
         if (old) {
@@ -130,7 +138,12 @@ export class Bridge {
             textBuffer: [],
             flushTimer: null,
             pendingQuestion: null,
+            pendingResume: null,
         };
+
+        const startOpts: { continue?: boolean; resume?: string } = {};
+        if (options?.continue) startOpts.continue = true;
+        if (options?.resume) startOpts.resume = options.resume;
 
         claude.start(
             (msg) => this.handleClaudeMessage(session, msg),
@@ -138,7 +151,7 @@ export class Bridge {
             () => {
                 void this.feishu.sendText(session.chatId, '⚠️ 检测到工具调用死循环，已自动中断。发 /new 重建会话。');
             },
-            options?.continue ? { continue: true } : undefined,
+            Object.keys(startOpts).length > 0 ? startOpts : undefined,
         );
 
         return session;
@@ -273,6 +286,61 @@ export class Bridge {
         session.claude.approvePermission(pq.requestId, updatedInput);
     }
 
+    /** 处理 /resume 命令 — 列出历史 session 或直接恢复指定 ID */
+    private handleResume(chatId: string, sessionIdArg?: string): string {
+        const session = this.sessions.get(chatId);
+        const cwd = session?.cwd || this.claudeConfig.cwd;
+
+        // 直接指定 session ID
+        if (sessionIdArg) {
+            const newSession = this.createSession(chatId, { resume: sessionIdArg });
+            this.sessions.set(chatId, newSession);
+            return `正在恢复 session ${sessionIdArg.slice(0, 8)}...\n工作目录: ${newSession.cwd}`;
+        }
+
+        // 列出可选 session
+        const sessions = listSessions(cwd);
+        if (sessions.length === 0) {
+            return '没有找到历史 session。';
+        }
+
+        // 确保有一个 session 对象来存 pendingResume
+        if (!session || !session.claude.isAlive()) {
+            const newSession = this.createSession(chatId);
+            this.sessions.set(chatId, newSession);
+            newSession.pendingResume = sessions;
+        } else {
+            session.pendingResume = sessions;
+        }
+
+        const lines = ['📋 历史 Session（回复序号选择）:', ''];
+        for (let i = 0; i < sessions.length; i++) {
+            const s = sessions[i];
+            const date = s.modifiedAt.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+            const preview = s.preview || '(空)';
+            lines.push(`${i + 1}. [${date}] ${preview}`);
+        }
+        lines.push('', '回复序号恢复，或发其他消息取消');
+        return lines.join('\n');
+    }
+
+    /** 用户选择了要恢复的 session */
+    private async resolveResume(session: ChatSession, chatId: string, text: string): Promise<void> {
+        const sessions = session.pendingResume!;
+        session.pendingResume = null;
+
+        const idx = parseInt(text.trim(), 10) - 1;
+        if (idx < 0 || idx >= sessions.length) {
+            void this.feishu.sendText(chatId, '已取消恢复。');
+            return;
+        }
+
+        const target = sessions[idx];
+        const newSession = this.createSession(chatId, { resume: target.sessionId });
+        this.sessions.set(chatId, newSession);
+        void this.feishu.sendText(chatId, `正在恢复 session ${target.sessionId.slice(0, 8)}...\n工作目录: ${newSession.cwd}`);
+    }
+
     /** 追加文本到 debounce 缓冲区 */
     private appendText(session: ChatSession, text: string): void {
         session.textBuffer.push(text);
@@ -309,6 +377,7 @@ export class Bridge {
                 '可用命令:',
                 '/new — 重新开始一个 Claude 会话',
                 '/new continue — 继续上次的 Claude 会话',
+                '/resume — 列出历史 session 并选择恢复',
                 '/cd <path> — 设置工作目录并重建会话',
                 '/cwd — 查看当前工作目录',
                 '/status — 查看当前会话状态',
@@ -372,6 +441,10 @@ export class Bridge {
 
         if (cmd === '/pending') {
             return this.handlePending(chatId);
+        }
+
+        if (cmd === '/resume') {
+            return this.handleResume(chatId, parts[1]);
         }
 
         return null;

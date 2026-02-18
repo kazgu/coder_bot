@@ -20,7 +20,7 @@ npx tsx --env-file=.env src/index.ts
 
 1. Create an app on [Feishu Open Platform](https://open.feishu.cn)
 2. Enable bot capability
-3. Add permissions: `im:message`, `im:message:send_as_bot`
+3. Add permissions: `im:message`, `im:message:send_as_bot`, `im:resource` (for image downloads)
 4. Publish the app
 
 No callback URL needed — the SDK connects via WebSocket automatically.
@@ -43,6 +43,8 @@ No callback URL needed — the SDK connects via WebSocket automatically.
 | `/help` | Show help |
 | `/new` | Start a new Claude session |
 | `/new continue` | Resume the last Claude session (`--continue`) |
+| `/resume` | List historical sessions and pick one to restore |
+| `/resume <id>` | Resume a specific session by ID |
 | `/cd <path>` | Change working directory and restart session |
 | `/cwd` | Show current working directory |
 | `/status` | Show current session status |
@@ -52,7 +54,7 @@ No callback URL needed — the SDK connects via WebSocket automatically.
 | `/deny all` | Deny all pending permission requests |
 | `/pending` | List pending permission requests |
 
-Send any text to chat with Claude Code. Each Feishu chat gets its own isolated Claude process.
+Send any text to chat with Claude Code. You can also send images — they'll be forwarded to Claude as base64. Each Feishu chat gets its own isolated Claude process.
 
 ## Permission Handling
 

@@ -1,5 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { Writable } from 'node:stream';
 import type { ClaudeConfig } from './config';
 
@@ -202,7 +205,7 @@ export class ClaudeProcess {
         onMessage: (msg: ClaudeMessage) => void,
         onPermissionRequest?: (perm: PendingPermission) => void,
         onLoopDetected?: () => void,
-        options?: { continue?: boolean },
+        options?: { continue?: boolean; resume?: string },
     ): void {
         if (this.alive) return;
 
@@ -220,6 +223,9 @@ export class ClaudeProcess {
 
         if (options?.continue) {
             args.push('--continue');
+        }
+        if (options?.resume) {
+            args.push('--resume', options.resume);
         }
 
         this.child = spawn(this.config.executable, args, {
@@ -699,4 +705,81 @@ function shouldAutoApprove(toolName: string, input: unknown): boolean {
     }
 
     return false;
+}
+
+// ─── Session listing ────────────────────────────────────────────────
+
+export interface SessionInfo {
+    sessionId: string;
+    modifiedAt: Date;
+    preview: string;
+}
+
+/**
+ * 列出指定工作目录下的 Claude 历史 session。
+ * 扫描 ~/.claude/projects/<project-hash>/*.jsonl，
+ * 读取第一条 user 消息作为预览。
+ */
+export function listSessions(cwd: string, limit = 10): SessionInfo[] {
+    const projectDir = cwd.replace(/[/_]/g, '-');
+    const sessionsPath = join(homedir(), '.claude', 'projects', projectDir);
+
+    let files: string[];
+    try {
+        files = readdirSync(sessionsPath).filter(f => f.endsWith('.jsonl'));
+    } catch {
+        return [];
+    }
+
+    const sessions: SessionInfo[] = [];
+    for (const file of files) {
+        const fullPath = join(sessionsPath, file);
+        const sessionId = file.replace('.jsonl', '');
+        let modifiedAt: Date;
+        try {
+            modifiedAt = statSync(fullPath).mtime;
+        } catch {
+            continue;
+        }
+
+        // 读取前 8KB 提取第一条 user 消息作为预览
+        let preview = '';
+        try {
+            const fd = openSync(fullPath, 'r');
+            const readBuf = Buffer.alloc(8192);
+            const bytesRead = readSync(fd, readBuf);
+            closeSync(fd);
+
+            const lines = readBuf.subarray(0, bytesRead).toString('utf-8').split('\n');
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const obj = JSON.parse(line);
+                    if (obj.type === 'user' && obj.message?.content) {
+                        const c = obj.message.content;
+                        if (typeof c === 'string') {
+                            preview = c.slice(0, 80);
+                        } else if (Array.isArray(c)) {
+                            for (const b of c) {
+                                if (b.type === 'text' && b.text) {
+                                    preview = b.text.slice(0, 80);
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                } catch {
+                    // skip malformed line
+                }
+            }
+        } catch {
+            // ignore read errors
+        }
+
+        sessions.push({ sessionId, modifiedAt, preview });
+    }
+
+    sessions.sort((a, b) => b.modifiedAt.getTime() - a.modifiedAt.getTime());
+    return sessions.slice(0, limit);
 }
