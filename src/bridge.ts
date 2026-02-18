@@ -360,10 +360,10 @@ export class Bridge {
         }
         if (session.textBuffer.length === 0) return;
 
-        const text = session.textBuffer.join('');
+        const text = session.textBuffer.join('').trim();
         session.textBuffer = [];
 
-        if (text.trim()) {
+        if (text) {
             void this.feishu.sendText(session.chatId, text);
         }
     }
