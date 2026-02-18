@@ -181,6 +181,9 @@ export class ClaudeProcess {
     private consecutiveToolErrors = 0;
     private static readonly MAX_TOOL_ERROR_RETRIES = 20;
 
+    /** 临时全部自动批准（/allow all 触发，turn 结束重置） */
+    private autoApproveAll = false;
+
     /** 消息流 */
     private inputStream = new Stream<ClaudeMessage>();
 
@@ -194,6 +197,7 @@ export class ClaudeProcess {
         onMessage: (msg: ClaudeMessage) => void,
         onPermissionRequest?: (perm: PendingPermission) => void,
         onLoopDetected?: () => void,
+        options?: { continue?: boolean },
     ): void {
         if (this.alive) return;
 
@@ -208,6 +212,10 @@ export class ClaudeProcess {
             '--permission-mode', this.config.permissionMode,
             '--permission-prompt-tool', 'stdio',
         ];
+
+        if (options?.continue) {
+            args.push('--continue');
+        }
 
         this.child = spawn(this.config.executable, args, {
             cwd: this.config.cwd,
@@ -341,6 +349,7 @@ export class ClaudeProcess {
                 // turn 结束重置计数
                 if (msg.type === 'result') {
                     this.consecutiveToolErrors = 0;
+                    this.autoApproveAll = false;
                 }
 
                 this.onMessage?.(msg);
@@ -415,6 +424,17 @@ export class ClaudeProcess {
             });
         }
 
+        // /allow all 临时全部批准（AskUserQuestion 除外，需要用户实际回答）
+        if (this.autoApproveAll && toolName !== 'AskUserQuestion') {
+            if (this.debug) {
+                console.log(`[auto-approve-all] ${toolName}`);
+            }
+            return Promise.resolve({
+                behavior: 'allow' as const,
+                updatedInput: (input as Record<string, unknown>) || {},
+            });
+        }
+
         // 需要用户审批 → 挂起
         return new Promise<PermissionResult>((resolve, reject) => {
             const perm: PendingPermission & { resolve: (r: PermissionResult) => void } = {
@@ -476,13 +496,13 @@ export class ClaudeProcess {
     }
 
     /** 批准权限请求 */
-    approvePermission(requestId: string): boolean {
+    approvePermission(requestId: string, updatedInput?: Record<string, unknown>): boolean {
         const perm = this.pendingPermissions.get(requestId) as (PendingPermission & { resolve?: (r: PermissionResult) => void }) | undefined;
         if (!perm?.resolve) return false;
 
         perm.resolve({
             behavior: 'allow',
-            updatedInput: (perm.input as Record<string, unknown>) || {},
+            updatedInput: updatedInput || (perm.input as Record<string, unknown>) || {},
         });
         this.pendingPermissions.delete(requestId);
         return true;
@@ -501,8 +521,9 @@ export class ClaudeProcess {
         return true;
     }
 
-    /** 批准所有待处理的权限请求 */
+    /** 批准所有待处理的权限请求，并开启临时自动批准直到 turn 结束 */
     approveAll(): number {
+        this.autoApproveAll = true;
         let count = 0;
         for (const requestId of [...this.pendingPermissions.keys()]) {
             if (this.approvePermission(requestId)) count++;
@@ -620,7 +641,6 @@ const SAFE_TOOLS = new Set([
     'Task', 'task',
     'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
     'WebSearch', 'WebFetch',
-    'AskUserQuestion',
     'EnterPlanMode', 'ExitPlanMode',
     'mcp__ide__getDiagnostics',
     // 'mcp__ide__executeCode',

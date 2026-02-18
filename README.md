@@ -42,11 +42,12 @@ No callback URL needed — the SDK connects via WebSocket automatically.
 |---------|-------------|
 | `/help` | Show help |
 | `/new` | Start a new Claude session |
+| `/new continue` | Resume the last Claude session (`--continue`) |
 | `/cd <path>` | Change working directory and restart session |
 | `/cwd` | Show current working directory |
 | `/status` | Show current session status |
 | `/allow` | Approve the latest permission request |
-| `/allow all` | Approve all pending permission requests |
+| `/allow all` | Approve all pending requests and auto-approve the rest of this turn |
 | `/deny` | Deny the latest permission request |
 | `/deny all` | Deny all pending permission requests |
 | `/pending` | List pending permission requests |
@@ -59,7 +60,10 @@ The bot uses a smart auto-approval strategy:
 
 - **Auto-approved**: Read, Glob, Grep, Task, Write, Edit, and other safe tools
 - **Auto-approved (Bash)**: Non-destructive commands like `ls`, `cat`, `git status`, `npm install`
+- **Interactive (AskUserQuestion)**: Questions are shown in Feishu chat; the bot waits for your reply and passes it back to Claude
 - **Requires confirmation**: `rm`, `sudo`, `chmod`, `kill`, `git push --force`, `curl | sh`, code execution, and unknown tools
+
+Using `/allow all` approves all pending requests and auto-approves subsequent requests for the rest of the current turn (except `AskUserQuestion`, which always requires your input).
 
 When a dangerous operation is detected, the bot sends a notification:
 

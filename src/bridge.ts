@@ -9,6 +9,17 @@ interface ChatSession {
     /** debounce 缓冲区 */
     textBuffer: string[];
     flushTimer: ReturnType<typeof setTimeout> | null;
+    /** 等待用户回答 AskUserQuestion 的请求 */
+    pendingQuestion: {
+        requestId: string;
+        questions: Array<{
+            question: string;
+            header?: string;
+            options?: Array<{ label: string; description?: string }>;
+            multiSelect?: boolean;
+        }>;
+        originalInput: Record<string, unknown>;
+    } | null;
 }
 
 const DEBOUNCE_MS = 1500;
@@ -47,6 +58,12 @@ export class Bridge {
             this.sessions.set(chatId, session);
         }
 
+        // 如果有待回答的问题，将用户消息作为答案
+        if (session.pendingQuestion && !text.startsWith('/')) {
+            this.resolveQuestion(session, text);
+            return;
+        }
+
         try {
             session.claude.send(text);
         } catch (err) {
@@ -56,7 +73,7 @@ export class Bridge {
     }
 
     /** 创建新的 Claude 会话 */
-    private createSession(chatId: string, cwd?: string): ChatSession {
+    private createSession(chatId: string, options?: { cwd?: string; continue?: boolean }): ChatSession {
         // 关闭旧会话
         const old = this.sessions.get(chatId);
         if (old) {
@@ -64,7 +81,7 @@ export class Bridge {
             old.claude.kill();
         }
 
-        const sessionCwd = cwd || old?.cwd || this.claudeConfig.cwd;
+        const sessionCwd = options?.cwd || old?.cwd || this.claudeConfig.cwd;
         const config = { ...this.claudeConfig, cwd: sessionCwd };
         const claude = new ClaudeProcess(config);
         const session: ChatSession = {
@@ -73,6 +90,7 @@ export class Bridge {
             cwd: sessionCwd,
             textBuffer: [],
             flushTimer: null,
+            pendingQuestion: null,
         };
 
         claude.start(
@@ -81,6 +99,7 @@ export class Bridge {
             () => {
                 void this.feishu.sendText(session.chatId, '⚠️ 检测到工具调用死循环，已自动中断。发 /new 重建会话。');
             },
+            options?.continue ? { continue: true } : undefined,
         );
 
         return session;
@@ -115,6 +134,12 @@ export class Bridge {
     private handlePermissionRequest(session: ChatSession, perm: PendingPermission): void {
         this.flushText(session);
 
+        // AskUserQuestion 特殊处理：展示问题，等待用户回答
+        if (perm.toolName === 'AskUserQuestion') {
+            this.handleAskUserQuestion(session, perm);
+            return;
+        }
+
         const inputStr = formatPermissionInput(perm.toolName, perm.input);
         const text = [
             `⚠️ Claude 请求权限`,
@@ -125,6 +150,88 @@ export class Bridge {
         ].join('\n');
 
         void this.feishu.sendText(session.chatId, text);
+    }
+
+    /** 处理 AskUserQuestion — 展示问题并等待用户回答 */
+    private handleAskUserQuestion(session: ChatSession, perm: PendingPermission): void {
+        const input = perm.input as Record<string, unknown>;
+        const questions = (input?.questions || []) as NonNullable<ChatSession['pendingQuestion']>['questions'];
+
+        if (questions.length === 0) {
+            // 没有问题内容，直接批准
+            session.claude.approvePermission(perm.requestId);
+            return;
+        }
+
+        // 保存待回答状态
+        session.pendingQuestion = {
+            requestId: perm.requestId,
+            questions,
+            originalInput: input,
+        };
+
+        // 格式化问题发送到飞书
+        const lines: string[] = ['❓ Claude 想问你:'];
+        for (let i = 0; i < questions.length; i++) {
+            const q = questions[i];
+            lines.push('');
+            lines.push(q.question);
+            if (q.options && q.options.length > 0) {
+                for (let j = 0; j < q.options.length; j++) {
+                    const opt = q.options[j];
+                    const desc = opt.description ? ` — ${opt.description}` : '';
+                    lines.push(`  ${j + 1}. ${opt.label}${desc}`);
+                }
+                lines.push('');
+                lines.push(q.multiSelect ? '可多选，用逗号分隔序号（如 1,3）' : '回复序号或直接输入你的答案');
+            } else {
+                lines.push('');
+                lines.push('直接回复你的答案');
+            }
+        }
+
+        void this.feishu.sendText(session.chatId, lines.join('\n'));
+    }
+
+    /** 将用户回复解析为 AskUserQuestion 的答案并批准 */
+    private resolveQuestion(session: ChatSession, userText: string): void {
+        const pq = session.pendingQuestion!;
+        session.pendingQuestion = null;
+
+        const answers: Record<string, string> = {};
+        // 简单策略：如果只有一个问题，整条消息就是答案
+        // 多个问题时按行分割
+        const parts = pq.questions.length === 1
+            ? [userText.trim()]
+            : userText.split('\n').map(s => s.trim()).filter(Boolean);
+
+        for (let i = 0; i < pq.questions.length; i++) {
+            const raw = (parts[i] || parts[0] || '').trim();
+            const q = pq.questions[i];
+
+            if (q.options && q.options.length > 0) {
+                // 尝试按序号匹配
+                if (q.multiSelect) {
+                    const indices = raw.split(/[,，\s]+/).map(s => parseInt(s, 10) - 1);
+                    const labels = indices
+                        .filter(idx => idx >= 0 && idx < q.options!.length)
+                        .map(idx => q.options![idx].label);
+                    answers[String(i)] = labels.length > 0 ? labels.join(',') : raw;
+                } else {
+                    const idx = parseInt(raw, 10) - 1;
+                    if (idx >= 0 && idx < q.options.length) {
+                        answers[String(i)] = q.options[idx].label;
+                    } else {
+                        answers[String(i)] = raw;
+                    }
+                }
+            } else {
+                answers[String(i)] = raw;
+            }
+        }
+
+        const updatedInput = { ...pq.originalInput, answers };
+        session.claude.approvePermission(pq.requestId, updatedInput);
     }
 
     /** 追加文本到 debounce 缓冲区 */
@@ -162,6 +269,7 @@ export class Bridge {
             return [
                 '可用命令:',
                 '/new — 重新开始一个 Claude 会话',
+                '/new continue — 继续上次的 Claude 会话',
                 '/cd <path> — 设置工作目录并重建会话',
                 '/cwd — 查看当前工作目录',
                 '/status — 查看当前会话状态',
@@ -177,9 +285,13 @@ export class Bridge {
         }
 
         if (cmd === '/new') {
-            const session = this.createSession(chatId);
+            const arg = parts[1]?.toLowerCase();
+            const isContinue = arg === 'continue' || arg === 'c';
+            const session = this.createSession(chatId, isContinue ? { continue: true } : undefined);
             this.sessions.set(chatId, session);
-            return `已创建新的 Claude 会话。\n工作目录: ${session.cwd}`;
+            return isContinue
+                ? `已继续上次 Claude 会话。\n工作目录: ${session.cwd}`
+                : `已创建新的 Claude 会话。\n工作目录: ${session.cwd}`;
         }
 
         if (cmd === '/cd') {
@@ -188,7 +300,7 @@ export class Bridge {
             const resolved = path.startsWith('/')
                 ? path
                 : `${this.sessions.get(chatId)?.cwd || this.claudeConfig.cwd}/${path}`;
-            const session = this.createSession(chatId, resolved);
+            const session = this.createSession(chatId, { cwd: resolved });
             this.sessions.set(chatId, session);
             return `工作目录已切换到: ${resolved}\n已重建 Claude 会话。`;
         }
@@ -236,8 +348,8 @@ export class Bridge {
         if (arg === 'all') {
             const count = session.claude.approveAll();
             return count > 0
-                ? `已批准 ${count} 个权限请求。`
-                : '没有待处理的权限请求。';
+                ? `已批准 ${count} 个权限请求，本轮后续请求将自动批准。`
+                : '已开启本轮自动批准。';
         }
 
         // 批准最新的一个
