@@ -56,6 +56,14 @@ export class Bridge {
         if (!session || !session.claude.isAlive()) {
             session = this.createSession(chatId);
             this.sessions.set(chatId, session);
+
+            const welcome = [
+                '🤖 Coder Bot 已就绪',
+                `📂 工作目录: ${session.cwd}`,
+                '',
+                '发送 /help 查看可用命令',
+            ].join('\n');
+            void this.feishu.sendText(chatId, welcome);
         }
 
         // 如果有待回答的问题，将用户消息作为答案
@@ -107,19 +115,6 @@ export class Bridge {
 
     /** 处理 Claude 输出消息 */
     private handleClaudeMessage(session: ChatSession, msg: ClaudeMessage): void {
-        // 首次收到 system 消息时发送欢迎信息
-        if (msg.type === 'system' && msg.session_id) {
-            const lines = [
-                '🤖 Coder Bot 已就绪',
-                `📂 工作目录: ${session.cwd}`,
-                `🔑 Session: ${msg.session_id}`,
-                '',
-                '发送 /help 查看可用命令',
-            ];
-            void this.feishu.sendText(session.chatId, lines.join('\n'));
-            return;
-        }
-
         if (msg.type === 'assistant' && msg.message) {
             const content = msg.message.content;
             if (typeof content === 'string') {
