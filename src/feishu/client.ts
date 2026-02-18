@@ -32,4 +32,19 @@ export class FeishuClient {
             },
         });
     }
+
+    /** 下载消息中的图片，返回 base64 字符串 */
+    async downloadImage(messageId: string, imageKey: string): Promise<string> {
+        const resp = await this.larkClient.im.v1.messageResource.get({
+            path: { message_id: messageId, file_key: imageKey },
+            params: { type: 'image' },
+        });
+
+        const stream = resp.getReadableStream();
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+            chunks.push(Buffer.from(chunk));
+        }
+        return Buffer.concat(chunks).toString('base64');
+    }
 }

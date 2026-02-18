@@ -31,6 +31,13 @@ async function main(): Promise<void> {
                 } catch {
                     // 忽略
                 }
+            } else if (msgType === 'image') {
+                try {
+                    const content = JSON.parse(message.content as string) as { image_key: string };
+                    void bridge.handleImageMessage(chatId, messageId, content.image_key);
+                } catch {
+                    // 忽略
+                }
             }
         },
     });

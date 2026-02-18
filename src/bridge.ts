@@ -1,6 +1,6 @@
 import type { ClaudeConfig } from './config';
 import type { FeishuClient } from './feishu/client';
-import { ClaudeProcess, type ClaudeMessage, type PendingPermission } from './claude';
+import { ClaudeProcess, type ClaudeMessage, type PendingPermission, type ContentBlock } from './claude';
 
 interface ChatSession {
     claude: ClaudeProcess;
@@ -77,6 +77,37 @@ export class Bridge {
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             await this.feishu.replyText(messageId, `发送失败: ${msg}`);
+        }
+    }
+
+    /** 处理飞书图片消息 */
+    async handleImageMessage(chatId: string, messageId: string, imageKey: string, text?: string): Promise<void> {
+        let session = this.sessions.get(chatId);
+        if (!session || !session.claude.isAlive()) {
+            session = this.createSession(chatId);
+            this.sessions.set(chatId, session);
+
+            const welcome = [
+                '🤖 Coder Bot 已就绪',
+                `📂 工作目录: ${session.cwd}`,
+                '',
+                '发送 /help 查看可用命令',
+            ].join('\n');
+            void this.feishu.sendText(chatId, welcome);
+        }
+
+        try {
+            const base64 = await this.feishu.downloadImage(messageId, imageKey);
+            const blocks: ContentBlock[] = [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+            ];
+            if (text) {
+                blocks.push({ type: 'text', text });
+            }
+            session.claude.send(blocks);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.feishu.replyText(messageId, `图片处理失败: ${msg}`);
         }
     }
 

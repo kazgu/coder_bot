@@ -33,6 +33,11 @@ export interface PendingPermission {
     createdAt: number;
 }
 
+/** 用户消息的 content block 类型 */
+export type ContentBlock =
+    | { type: 'text'; text: string }
+    | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
 /** 权限审批结果 */
 type PermissionResult = {
     behavior: 'allow';
@@ -475,8 +480,8 @@ export class ClaudeProcess {
 
     // ─── Public API ──────────────────────────────────────────────────
 
-    /** 发送用户消息 */
-    send(text: string): void {
+    /** 发送用户消息（文本或包含图片的 content 数组） */
+    send(content: string | ContentBlock[]): void {
         if (!this.childStdin || !this.alive) {
             throw new Error('Claude process not running');
         }
@@ -485,7 +490,7 @@ export class ClaudeProcess {
             type: 'user',
             message: {
                 role: 'user',
-                content: text,
+                content,
             },
         };
 
