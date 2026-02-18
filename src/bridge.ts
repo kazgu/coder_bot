@@ -1,5 +1,6 @@
 import type { ClaudeConfig } from './config';
 import type { FeishuClient } from './feishu/client';
+import sharp from 'sharp';
 import { ClaudeProcess, listSessions, type ClaudeMessage, type PendingPermission, type ContentBlock, type SessionInfo } from './claude';
 
 interface ChatSession {
@@ -105,9 +106,10 @@ export class Bridge {
         }
 
         try {
-            const base64 = await this.feishu.downloadImage(messageId, imageKey);
+            const rawBase64 = await this.feishu.downloadImage(messageId, imageKey);
+            const { base64, mediaType } = await compressImageIfNeeded(rawBase64);
             const blocks: ContentBlock[] = [
-                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } },
+                { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
             ];
             if (text) {
                 blocks.push({ type: 'text', text });
@@ -552,4 +554,43 @@ function formatPermissionInput(toolName: string, input: unknown): string {
         return str.slice(0, 200) + '...';
     }
     return str;
+}
+
+/** base64 大小上限 (14MB，留余量给 JSON 开销) */
+const MAX_BASE64_BYTES = 14 * 1024 * 1024;
+
+/**
+ * 如果图片 base64 超过限制，用 sharp 压缩。
+ * 先尝试转 JPEG quality 80，再逐步降低质量和尺寸。
+ */
+async function compressImageIfNeeded(base64: string): Promise<{ base64: string; mediaType: string }> {
+    if (base64.length <= MAX_BASE64_BYTES) {
+        return { base64, mediaType: 'image/png' };
+    }
+
+    const buf = Buffer.from(base64, 'base64');
+    const steps: Array<{ maxDim: number; quality: number }> = [
+        { maxDim: 4096, quality: 85 },
+        { maxDim: 2048, quality: 80 },
+        { maxDim: 1600, quality: 70 },
+        { maxDim: 1200, quality: 60 },
+    ];
+
+    for (const { maxDim, quality } of steps) {
+        const compressed = await sharp(buf)
+            .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality })
+            .toBuffer();
+        const result = compressed.toString('base64');
+        if (result.length <= MAX_BASE64_BYTES) {
+            return { base64: result, mediaType: 'image/jpeg' };
+        }
+    }
+
+    // 最后兜底：强制缩到 800px
+    const fallback = await sharp(buf)
+        .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 50 })
+        .toBuffer();
+    return { base64: fallback.toString('base64'), mediaType: 'image/jpeg' };
 }

@@ -9,7 +9,8 @@
         "typecheck": "tsc --noEmit"
     },
     "dependencies": {
-        "@larksuiteoapi/node-sdk": "^1.59.0"
+        "@larksuiteoapi/node-sdk": "^1.59.0",
+        "sharp": "^0.34.5"
     },
     "devDependencies": {
         "@types/node": ">=20",
