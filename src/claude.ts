@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Writable } from 'node:stream';
 import type { ClaudeConfig } from './config';
+import type { AgentProcess, AgentMessage, PendingPermission, ContentBlock } from './agent';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -28,18 +29,7 @@ export interface ClaudeMessage {
     [key: string]: unknown;
 }
 
-/** 待审批的权限请求 */
-export interface PendingPermission {
-    requestId: string;
-    toolName: string;
-    input: unknown;
-    createdAt: number;
-}
-
-/** 用户消息的 content block 类型 */
-export type ContentBlock =
-    | { type: 'text'; text: string }
-    | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+export type { PendingPermission, ContentBlock } from './agent';
 
 /** 权限审批结果 */
 type PermissionResult = {
@@ -166,13 +156,15 @@ type ControlResponseHandler = (response: SDKControlResponse['response']) => void
  * - 权限处理异步化，每个请求有独立 AbortController
  * - 干净的进程退出处理
  */
-export class ClaudeProcess {
+export class ClaudeProcess implements AgentProcess {
+    readonly backend = 'claude' as const;
+
     private child: ChildProcessWithoutNullStreams | null = null;
     private childStdin: Writable | null = null;
     private readonly config: ClaudeConfig;
     private readonly debug: boolean;
 
-    private onMessage: ((msg: ClaudeMessage) => void) | null = null;
+    private onMessage: ((msg: AgentMessage) => void) | null = null;
     private onPermissionRequest: ((perm: PendingPermission) => void) | null = null;
     private onLoopDetected: (() => void) | null = null;
 
@@ -202,7 +194,7 @@ export class ClaudeProcess {
 
     /** 启动 Claude 进程 */
     start(
-        onMessage: (msg: ClaudeMessage) => void,
+        onMessage: (msg: AgentMessage) => void,
         onPermissionRequest?: (perm: PendingPermission) => void,
         onLoopDetected?: () => void,
         options?: { continue?: boolean; resume?: string },
@@ -363,7 +355,11 @@ export class ClaudeProcess {
                     this.autoApproveAll = false;
                 }
 
-                this.onMessage?.(msg);
+                // 转换为 AgentMessage 并回调
+                const agentMessages = claudeToAgentMessages(msg);
+                for (const am of agentMessages) {
+                    this.onMessage?.(am);
+                }
             }
         } catch (error) {
             console.error('[claude] Message consumer error:', (error as Error).message);
@@ -640,6 +636,39 @@ export class ClaudeProcess {
             console.log(tag, JSON.stringify(msg).slice(0, 300));
         }
     }
+}
+
+// ─── Claude → AgentMessage conversion ───────────────────────────────
+
+/** 将 Claude 原始消息转换为统一的 AgentMessage 数组 */
+function claudeToAgentMessages(msg: ClaudeMessage): AgentMessage[] {
+    const messages: AgentMessage[] = [];
+
+    if (msg.type === 'assistant' && msg.message) {
+        const content = msg.message.content;
+        if (typeof content === 'string') {
+            messages.push({ type: 'text', text: content, raw: msg });
+        } else if (Array.isArray(content)) {
+            for (const block of content) {
+                if (block.type === 'text' && block.text) {
+                    messages.push({ type: 'text', text: block.text, raw: msg });
+                } else if (block.type === 'tool_use') {
+                    messages.push({ type: 'tool_use', toolName: block.name || 'unknown', raw: msg });
+                }
+            }
+        }
+    } else if (msg.type === 'result') {
+        messages.push({
+            type: msg.is_error ? 'error' : 'result',
+            text: msg.result || undefined,
+            isError: msg.is_error || false,
+            raw: msg,
+        });
+    } else if (msg.type === 'system') {
+        messages.push({ type: 'system', sessionId: msg.session_id || undefined, raw: msg });
+    }
+
+    return messages;
 }
 
 // ─── Auto-approval strategy ─────────────────────────────────────────

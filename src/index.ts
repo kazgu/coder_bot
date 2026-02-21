@@ -9,8 +9,8 @@ async function main(): Promise<void> {
     // 飞书客户端
     const feishuClient = new FeishuClient(appConfig.feishu);
 
-    // Bridge: 飞书 ↔ Claude Code
-    const bridge = new Bridge(appConfig.claude, feishuClient);
+    // Bridge: 飞书 ↔ Agent (Claude / Codex)
+    const bridge = new Bridge(appConfig, feishuClient);
 
     // 飞书事件分发
     const eventDispatcher = new Lark.EventDispatcher({});

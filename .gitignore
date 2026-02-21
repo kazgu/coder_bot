@@ -2,3 +2,4 @@ node_modules
 .env
 CLAUDE.md
 Claude_Code_SDK.pdf
+AGENTS.md

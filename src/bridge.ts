@@ -1,12 +1,15 @@
-import type { ClaudeConfig } from './config';
+import type { AppConfig } from './config';
 import type { FeishuClient } from './feishu/client';
+import type { AgentProcess, AgentMessage, AgentBackend, PendingPermission, ContentBlock } from './agent';
 import sharp from 'sharp';
-import { ClaudeProcess, listSessions, type ClaudeMessage, type PendingPermission, type ContentBlock, type SessionInfo } from './claude';
+import { ClaudeProcess, listSessions, type SessionInfo } from './claude';
+import { CodexProcess } from './codex';
 
 interface ChatSession {
-    claude: ClaudeProcess;
+    agent: AgentProcess;
     chatId: string;
     cwd: string;
+    backend: AgentBackend;
     /** debounce 缓冲区 */
     textBuffer: string[];
     flushTimer: ReturnType<typeof setTimeout> | null;
@@ -27,19 +30,26 @@ interface ChatSession {
 
 const DEBOUNCE_MS = 1500;
 
+const BACKEND_LABELS: Record<AgentBackend, string> = {
+    claude: 'Claude',
+    codex: 'Codex',
+};
+
 /**
- * 桥接飞书聊天和 Claude Code 进程。
- * 每个飞书 chat 对应一个独立的 Claude 进程。
- * 支持权限审批：Claude 请求工具权限时推送飞书通知，
+ * 桥接飞书聊天和 Agent 进程（Claude / Codex）。
+ * 每个飞书 chat 对应一个独立的 Agent 进程。
+ * 支持权限审批：Agent 请求工具权限时推送飞书通知，
  * 用户通过 /allow 和 /deny 命令响应。
  */
 export class Bridge {
-    private readonly claudeConfig: ClaudeConfig;
+    private readonly appConfig: AppConfig;
     private readonly feishu: FeishuClient;
     private readonly sessions = new Map<string, ChatSession>();
+    /** 每个 chat 记住上次使用的后端 */
+    private readonly chatBackends = new Map<string, AgentBackend>();
 
-    constructor(claudeConfig: ClaudeConfig, feishu: FeishuClient) {
-        this.claudeConfig = claudeConfig;
+    constructor(appConfig: AppConfig, feishu: FeishuClient) {
+        this.appConfig = appConfig;
         this.feishu = feishu;
     }
 
@@ -54,14 +64,15 @@ export class Bridge {
             }
         }
 
-        // 获取或创建 Claude 会话
+        // 获取或创建会话
         let session = this.sessions.get(chatId);
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             session = this.createSession(chatId);
             this.sessions.set(chatId, session);
 
+            const label = BACKEND_LABELS[session.backend];
             const welcome = [
-                '🤖 Coder Bot 已就绪',
+                `🤖 Coder Bot 已就绪 (${label})`,
                 `📂 工作目录: ${session.cwd}`,
                 '',
                 '发送 /help 查看可用命令',
@@ -82,7 +93,7 @@ export class Bridge {
         }
 
         try {
-            session.claude.send(text);
+            session.agent.send(text);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             await this.feishu.replyText(messageId, `发送失败: ${msg}`);
@@ -92,12 +103,13 @@ export class Bridge {
     /** 处理飞书图片消息 */
     async handleImageMessage(chatId: string, messageId: string, imageKey: string, text?: string): Promise<void> {
         let session = this.sessions.get(chatId);
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             session = this.createSession(chatId);
             this.sessions.set(chatId, session);
 
+            const label = BACKEND_LABELS[session.backend];
             const welcome = [
-                '🤖 Coder Bot 已就绪',
+                `🤖 Coder Bot 已就绪 (${label})`,
                 `📂 工作目录: ${session.cwd}`,
                 '',
                 '发送 /help 查看可用命令',
@@ -114,29 +126,45 @@ export class Bridge {
             if (text) {
                 blocks.push({ type: 'text', text });
             }
-            session.claude.send(blocks);
+            session.agent.send(blocks);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             await this.feishu.replyText(messageId, `图片处理失败: ${msg}`);
         }
     }
 
-    /** 创建新的 Claude 会话 */
-    private createSession(chatId: string, options?: { cwd?: string; continue?: boolean; resume?: string }): ChatSession {
+    /** 获取 chat 当前使用的后端 */
+    private getBackend(chatId: string): AgentBackend {
+        return this.chatBackends.get(chatId) || this.appConfig.defaultBackend;
+    }
+
+    /** 创建 Agent 进程 */
+    private createAgentProcess(backend: AgentBackend, cwd: string): AgentProcess {
+        if (backend === 'codex') {
+            return new CodexProcess({ ...this.appConfig.codex, cwd });
+        }
+        return new ClaudeProcess({ ...this.appConfig.claude, cwd });
+    }
+
+    /** 创建新会话 */
+    private createSession(chatId: string, options?: { cwd?: string; continue?: boolean; resume?: string; backend?: AgentBackend }): ChatSession {
         // 关闭旧会话
         const old = this.sessions.get(chatId);
         if (old) {
             this.flushText(old);
-            old.claude.kill();
+            old.agent.kill();
         }
 
-        const sessionCwd = options?.cwd || old?.cwd || this.claudeConfig.cwd;
-        const config = { ...this.claudeConfig, cwd: sessionCwd };
-        const claude = new ClaudeProcess(config);
+        const backend = options?.backend || this.getBackend(chatId);
+        this.chatBackends.set(chatId, backend);
+
+        const sessionCwd = options?.cwd || old?.cwd || this.appConfig.claude.cwd;
+        const agent = this.createAgentProcess(backend, sessionCwd);
         const session: ChatSession = {
-            claude,
+            agent,
             chatId,
             cwd: sessionCwd,
+            backend,
             textBuffer: [],
             flushTimer: null,
             pendingQuestion: null,
@@ -147,8 +175,8 @@ export class Bridge {
         if (options?.continue) startOpts.continue = true;
         if (options?.resume) startOpts.resume = options.resume;
 
-        claude.start(
-            (msg) => this.handleClaudeMessage(session, msg),
+        agent.start(
+            (msg) => this.handleAgentMessage(session, msg),
             (perm) => this.handlePermissionRequest(session, perm),
             () => {
                 void this.feishu.sendText(session.chatId, '⚠️ 检测到工具调用死循环，已自动中断。发 /new 重建会话。');
@@ -159,28 +187,26 @@ export class Bridge {
         return session;
     }
 
-    /** 处理 Claude 输出消息 */
-    private handleClaudeMessage(session: ChatSession, msg: ClaudeMessage): void {
-        if (msg.type === 'assistant' && msg.message) {
-            const content = msg.message.content;
-            if (typeof content === 'string') {
-                this.appendText(session, content);
-            } else if (Array.isArray(content)) {
-                for (const block of content) {
-                    if (block.type === 'text' && block.text) {
-                        this.appendText(session, block.text);
-                    } else if (block.type === 'tool_use') {
-                        this.flushText(session);
-                        const name = block.name || 'unknown';
-                        void this.feishu.sendText(session.chatId, `🔧 ${name}`);
-                    }
-                }
-            }
-        } else if (msg.type === 'result') {
-            this.flushText(session);
-            if (msg.is_error) {
-                void this.feishu.sendText(session.chatId, `❌ ${msg.result || '执行出错'}`);
-            }
+    /** 处理 Agent 输出消息（统一格式） */
+    private handleAgentMessage(session: ChatSession, msg: AgentMessage): void {
+        switch (msg.type) {
+            case 'text':
+                if (msg.text) this.appendText(session, msg.text);
+                break;
+            case 'tool_use':
+                this.flushText(session);
+                void this.feishu.sendText(session.chatId, `🔧 ${msg.toolName || 'unknown'}`);
+                break;
+            case 'result':
+                this.flushText(session);
+                break;
+            case 'error':
+                this.flushText(session);
+                void this.feishu.sendText(session.chatId, `❌ ${msg.text || '执行出错'}`);
+                break;
+            case 'system':
+                // 系统消息通常不需要展示
+                break;
         }
     }
 
@@ -188,15 +214,16 @@ export class Bridge {
     private handlePermissionRequest(session: ChatSession, perm: PendingPermission): void {
         this.flushText(session);
 
-        // AskUserQuestion 特殊处理：展示问题，等待用户回答
+        // AskUserQuestion 特殊处理（仅 Claude 后端）
         if (perm.toolName === 'AskUserQuestion') {
             this.handleAskUserQuestion(session, perm);
             return;
         }
 
+        const label = BACKEND_LABELS[session.backend];
         const inputStr = formatPermissionInput(perm.toolName, perm.input);
         const text = [
-            `⚠️ Claude 请求权限`,
+            `⚠️ ${label} 请求权限`,
             `工具: ${perm.toolName}`,
             inputStr,
             '',
@@ -212,20 +239,18 @@ export class Bridge {
         const questions = (input?.questions || []) as NonNullable<ChatSession['pendingQuestion']>['questions'];
 
         if (questions.length === 0) {
-            // 没有问题内容，直接批准
-            session.claude.approvePermission(perm.requestId);
+            session.agent.approvePermission(perm.requestId);
             return;
         }
 
-        // 保存待回答状态
         session.pendingQuestion = {
             requestId: perm.requestId,
             questions,
             originalInput: input,
         };
 
-        // 格式化问题发送到飞书
-        const lines: string[] = ['❓ Claude 想问你:'];
+        const label = BACKEND_LABELS[session.backend];
+        const lines: string[] = [`❓ ${label} 想问你:`];
         for (let i = 0; i < questions.length; i++) {
             const q = questions[i];
             lines.push('');
@@ -253,8 +278,6 @@ export class Bridge {
         session.pendingQuestion = null;
 
         const answers: Record<string, string> = {};
-        // 简单策略：如果只有一个问题，整条消息就是答案
-        // 多个问题时按行分割
         const parts = pq.questions.length === 1
             ? [userText.trim()]
             : userText.split('\n').map(s => s.trim()).filter(Boolean);
@@ -264,7 +287,6 @@ export class Bridge {
             const q = pq.questions[i];
 
             if (q.options && q.options.length > 0) {
-                // 尝试按序号匹配
                 if (q.multiSelect) {
                     const indices = raw.split(/[,，\s]+/).map(s => parseInt(s, 10) - 1);
                     const labels = indices
@@ -285,29 +307,32 @@ export class Bridge {
         }
 
         const updatedInput = { ...pq.originalInput, answers };
-        session.claude.approvePermission(pq.requestId, updatedInput);
+        session.agent.approvePermission(pq.requestId, updatedInput);
     }
 
-    /** 处理 /resume 命令 — 列出历史 session 或直接恢复指定 ID */
+    /** 处理 /resume 命令 — 列出历史 session 或直接恢复指定 ID（仅 Claude） */
     private handleResume(chatId: string, sessionIdArg?: string): string {
         const session = this.sessions.get(chatId);
-        const cwd = session?.cwd || this.claudeConfig.cwd;
+        const backend = this.getBackend(chatId);
 
-        // 直接指定 session ID
+        if (backend === 'codex') {
+            return 'Codex 暂不支持 /resume，请使用 /claude 切换到 Claude 后再试。';
+        }
+
+        const cwd = session?.cwd || this.appConfig.claude.cwd;
+
         if (sessionIdArg) {
             const newSession = this.createSession(chatId, { resume: sessionIdArg });
             this.sessions.set(chatId, newSession);
             return `正在恢复 session ${sessionIdArg.slice(0, 8)}...\n工作目录: ${newSession.cwd}`;
         }
 
-        // 列出可选 session
         const sessions = listSessions(cwd);
         if (sessions.length === 0) {
             return '没有找到历史 session。';
         }
 
-        // 确保有一个 session 对象来存 pendingResume
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             const newSession = this.createSession(chatId);
             this.sessions.set(chatId, newSession);
             newSession.pendingResume = sessions;
@@ -375,11 +400,14 @@ export class Bridge {
         const cmd = parts[0].toLowerCase();
 
         if (cmd === '/help') {
+            const backend = this.getBackend(chatId);
             return [
-                '可用命令:',
-                '/new — 重新开始一个 Claude 会话',
+                `可用命令 (当前后端: ${BACKEND_LABELS[backend]}):`,
+                '/new — 重新开始会话',
                 '/new continue — 继续上次的 Claude 会话',
-                '/resume — 列出历史 session 并选择恢复',
+                '/claude — 切换到 Claude 后端',
+                '/codex — 切换到 Codex 后端',
+                '/resume — 列出历史 session 并选择恢复 (仅 Claude)',
                 '/cd <path> — 设置工作目录并重建会话',
                 '/cwd — 查看当前工作目录',
                 '/status — 查看当前会话状态',
@@ -390,8 +418,20 @@ export class Bridge {
                 '/pending — 查看待处理的权限请求',
                 '/help — 显示帮助',
                 '',
-                '直接发文本即可与 Claude Code 对话。',
+                '直接发文本即可对话。',
             ].join('\n');
+        }
+
+        if (cmd === '/claude') {
+            const session = this.createSession(chatId, { backend: 'claude' });
+            this.sessions.set(chatId, session);
+            return `已切换到 Claude 后端。\n工作目录: ${session.cwd}`;
+        }
+
+        if (cmd === '/codex') {
+            const session = this.createSession(chatId, { backend: 'codex' });
+            this.sessions.set(chatId, session);
+            return `已切换到 Codex 后端。\n工作目录: ${session.cwd}`;
         }
 
         if (cmd === '/new') {
@@ -399,9 +439,10 @@ export class Bridge {
             const isContinue = arg === 'continue' || arg === 'c';
             const session = this.createSession(chatId, isContinue ? { continue: true } : undefined);
             this.sessions.set(chatId, session);
+            const label = BACKEND_LABELS[session.backend];
             return isContinue
-                ? `已继续上次 Claude 会话。\n工作目录: ${session.cwd}`
-                : `已创建新的 Claude 会话。\n工作目录: ${session.cwd}`;
+                ? `已继续上次 ${label} 会话。\n工作目录: ${session.cwd}`
+                : `已创建新的 ${label} 会话。\n工作目录: ${session.cwd}`;
         }
 
         if (cmd === '/cd') {
@@ -409,28 +450,29 @@ export class Bridge {
             if (!path) return '用法: /cd <path>';
             const resolved = path.startsWith('/')
                 ? path
-                : `${this.sessions.get(chatId)?.cwd || this.claudeConfig.cwd}/${path}`;
+                : `${this.sessions.get(chatId)?.cwd || this.appConfig.claude.cwd}/${path}`;
             const session = this.createSession(chatId, { cwd: resolved });
             this.sessions.set(chatId, session);
-            return `工作目录已切换到: ${resolved}\n已重建 Claude 会话。`;
+            return `工作目录已切换到: ${resolved}\n已重建会话。`;
         }
 
         if (cmd === '/cwd') {
             const session = this.sessions.get(chatId);
-            const cwd = session?.cwd || this.claudeConfig.cwd;
+            const cwd = session?.cwd || this.appConfig.claude.cwd;
             return `当前工作目录: ${cwd}`;
         }
 
         if (cmd === '/status') {
             const session = this.sessions.get(chatId);
             if (!session) return '当前没有活跃会话。发消息即可自动创建。';
-            const alive = session.claude.isAlive() ? '运行中' : '已停止';
-            const sid = session.claude.getSessionId() || '(未知)';
-            const pending = session.claude.getPendingPermissions();
+            const label = BACKEND_LABELS[session.backend];
+            const alive = session.agent.isAlive() ? '运行中' : '已停止';
+            const sid = session.agent.getSessionId() || '(未知)';
+            const pending = session.agent.getPendingPermissions();
             const pendingStr = pending.length > 0
                 ? `\n待审批权限: ${pending.length} 个`
                 : '';
-            return `状态: ${alive}\nSession: ${sid}\n工作目录: ${session.cwd}${pendingStr}`;
+            return `后端: ${label}\n状态: ${alive}\nSession: ${sid}\n工作目录: ${session.cwd}${pendingStr}`;
         }
 
         if (cmd === '/allow') {
@@ -455,60 +497,59 @@ export class Bridge {
     /** 处理 /allow 命令 */
     private handleAllow(chatId: string, arg?: string): string {
         const session = this.sessions.get(chatId);
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             return '当前没有活跃会话。';
         }
 
         if (arg === 'all') {
-            const count = session.claude.approveAll();
+            const count = session.agent.approveAll();
             return count > 0
                 ? `已批准 ${count} 个权限请求，本轮后续请求将自动批准。`
                 : '已开启本轮自动批准。';
         }
 
-        // 批准最新的一个
-        const pending = session.claude.getPendingPermissions();
+        const pending = session.agent.getPendingPermissions();
         if (pending.length === 0) {
             return '没有待处理的权限请求。';
         }
 
         const latest = pending[pending.length - 1];
-        session.claude.approvePermission(latest.requestId);
+        session.agent.approvePermission(latest.requestId);
         return `已批准: ${latest.toolName}`;
     }
 
     /** 处理 /deny 命令 */
     private handleDeny(chatId: string, arg?: string): string {
         const session = this.sessions.get(chatId);
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             return '当前没有活跃会话。';
         }
 
         if (arg === 'all') {
-            const count = session.claude.denyAll();
+            const count = session.agent.denyAll();
             return count > 0
                 ? `已拒绝 ${count} 个权限请求。`
                 : '没有待处理的权限请求。';
         }
 
-        const pending = session.claude.getPendingPermissions();
+        const pending = session.agent.getPendingPermissions();
         if (pending.length === 0) {
             return '没有待处理的权限请求。';
         }
 
         const latest = pending[pending.length - 1];
-        session.claude.denyPermission(latest.requestId);
+        session.agent.denyPermission(latest.requestId);
         return `已拒绝: ${latest.toolName}`;
     }
 
     /** 处理 /pending 命令 */
     private handlePending(chatId: string): string {
         const session = this.sessions.get(chatId);
-        if (!session || !session.claude.isAlive()) {
+        if (!session || !session.agent.isAlive()) {
             return '当前没有活跃会话。';
         }
 
-        const pending = session.claude.getPendingPermissions();
+        const pending = session.agent.getPendingPermissions();
         if (pending.length === 0) {
             return '没有待处理的权限请求。';
         }
@@ -525,7 +566,7 @@ export class Bridge {
     close(): void {
         for (const session of this.sessions.values()) {
             this.flushText(session);
-            session.claude.kill();
+            session.agent.kill();
         }
         this.sessions.clear();
     }
@@ -537,8 +578,8 @@ function formatPermissionInput(toolName: string, input: unknown): string {
 
     const obj = input as Record<string, unknown>;
 
-    // Bash 命令
-    if (toolName === 'Bash' || toolName === 'bash') {
+    // Bash 命令（Claude 和 Codex）
+    if (toolName === 'Bash' || toolName === 'bash' || toolName === 'CodexBash') {
         if (obj.command) return `命令: ${obj.command}`;
     }
 
